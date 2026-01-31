@@ -425,5 +425,206 @@ def cmd_shell():
     os.execvp("ssh", ["ssh", "-t", "runpod", f"tmux attach -t train 2>/dev/null || tmux new-session -s train"])
 
 
+# ============================================================================
+# Grid Search Commands
+# ============================================================================
+
+@cli.group()
+def grid():
+    """Manage grid search experiments for RoPE hyperparameters."""
+    pass
+
+
+@grid.command("list")
+@click.option("--rope-bases", type=str, default=None, help="Comma-separated RoPE base frequencies (default: 512,1024,2048,4096)")
+@click.option("--truncations", type=str, default=None, help="Comma-separated truncation splits (default: 0.25,0.5,0.75)")
+@click.option("--replicates", type=int, default=3, help="Number of replicates per config (default: 3)")
+def cmd_grid_list(rope_bases: str | None, truncations: str | None, replicates: int):
+    """List all grid search configurations."""
+    # Global options must come before subcommand
+    args = ["python", "grid_search.py", "--replicates", str(replicates)]
+    if rope_bases:
+        args.extend(["--rope-bases"] + rope_bases.split(","))
+    if truncations:
+        args.extend(["--truncations"] + truncations.split(","))
+    args.append("list")
+    run_cmd(args, cwd=REPO_DIR)
+
+
+@grid.command("run")
+@click.argument("config_id", type=int)
+@click.option("--rope-bases", type=str, default=None, help="Comma-separated RoPE base frequencies")
+@click.option("--truncations", type=str, default=None, help="Comma-separated truncation splits")
+@click.option("--replicates", type=int, default=3, help="Number of replicates per config")
+@click.option("--single-gpu", is_flag=True, default=True, help="Use single GPU mode (default: True)")
+def cmd_grid_run(config_id: int, rope_bases: str | None, truncations: str | None, replicates: int, single_gpu: bool):
+    """Run a specific grid search configuration on the remote instance."""
+    if not ssh_available():
+        click.echo("Error: Cannot connect to RunPod. Run 'configure' first.", err=True)
+        sys.exit(1)
+
+    # Build grid_search.py command to get config details
+    # Global options must come before subcommand
+    local_args = ["python", "grid_search.py", "--replicates", str(replicates)]
+    if rope_bases:
+        local_args.extend(["--rope-bases"] + rope_bases.split(","))
+    if truncations:
+        local_args.extend(["--truncations"] + truncations.split(","))
+    local_args.append("list")
+
+    # Get configuration from local grid_search.py
+    import json
+    result = run_cmd(local_args, cwd=REPO_DIR, capture=True)
+    lines = result.stdout.strip().split("\n")
+
+    # Parse the config from the list output
+    config_line = None
+    for line in lines:
+        if line.startswith(f"{config_id:3d} "):
+            config_line = line
+            break
+
+    if not config_line:
+        click.echo(f"Error: Config ID {config_id} not found", err=True)
+        sys.exit(1)
+
+    # Parse config_line: "  0 rope512_trunc0.25_rep0               512      0.25    0"
+    parts = config_line.split()
+    config_id_str = parts[1]  # e.g., "rope512_trunc0.25_rep0"
+    rope_base_val = parts[2]  # e.g., "512"
+    truncation_val = parts[3]  # e.g., "0.25"
+
+    click.echo(f"Running grid config {config_id}: {config_id_str}")
+    click.echo(f"  RoPE base: {rope_base_val}")
+    click.echo(f"  Truncation: {truncation_val}")
+
+    # Check if already running
+    result = ssh_cmd(f"test -f {REMOTE_PIDFILE} && ps -p $(cat {REMOTE_PIDFILE}) > /dev/null 2>&1 && echo running || echo stopped", capture=True)
+    if result.stdout.strip() == "running":
+        click.echo("Training is already running. Use 'train stop' first.")
+        sys.exit(1)
+
+    # Build environment exports
+    env_exports = f"export ROPE_BASE={rope_base_val} && export TRUNCATION_SPLIT={truncation_val} && export GRID_CONFIG_ID={config_id_str}"
+    if single_gpu:
+        env_exports += " && export SINGLE_GPU=1"
+
+    train_cmd = "torchrun --nproc_per_node=1 train_gpt_grid.py"
+
+    # Create unique log file for this config
+    log_file = f"{REMOTE_REPO}/logs/grid_{config_id_str}.log"
+
+    # Start training with nohup, save pid
+    remote_cmd = f"""
+        cd {REMOTE_REPO} && mkdir -p logs && {env_exports} && nohup {train_cmd} > {log_file} 2>&1 & echo $! > {REMOTE_PIDFILE}
+    """
+
+    click.echo("Starting training...")
+    ssh_cmd(remote_cmd)
+
+    # Verify it started
+    import time
+    time.sleep(2)
+    result = ssh_cmd(f"test -f {REMOTE_PIDFILE} && ps -p $(cat {REMOTE_PIDFILE}) > /dev/null 2>&1 && echo running || echo stopped", capture=True)
+
+    if result.stdout.strip() == "running":
+        pid = ssh_cmd(f"cat {REMOTE_PIDFILE}", capture=True).stdout.strip()
+        click.echo(f"Training started (PID: {pid})")
+        click.echo(f"Log file: {log_file}")
+        click.echo()
+        click.echo("Monitor with: python runpod_cli.py train check")
+        click.echo("Stop with: python runpod_cli.py train stop")
+    else:
+        click.echo("Training failed to start. Check logs:", err=True)
+        ssh_cmd(f"tail -50 {log_file}", check=False)
+        sys.exit(1)
+
+
+@grid.command("run-all")
+@click.option("--rope-bases", type=str, default=None, help="Comma-separated RoPE base frequencies")
+@click.option("--truncations", type=str, default=None, help="Comma-separated truncation splits")
+@click.option("--replicates", type=int, default=3, help="Number of replicates per config")
+@click.option("--single-gpu", is_flag=True, default=True, help="Use single GPU mode")
+@click.option("--start-from", type=int, default=0, help="Start from config ID (for resuming)")
+def cmd_grid_run_all(rope_bases: str | None, truncations: str | None, replicates: int, single_gpu: bool, start_from: int):
+    """Run all grid search configurations sequentially on the remote instance."""
+    if not ssh_available():
+        click.echo("Error: Cannot connect to RunPod. Run 'configure' first.", err=True)
+        sys.exit(1)
+
+    # Build grid_search.py command to get total config count
+    # Global options must come before subcommand
+    local_args = ["python", "grid_search.py", "--replicates", str(replicates)]
+    if rope_bases:
+        local_args.extend(["--rope-bases"] + rope_bases.split(","))
+    if truncations:
+        local_args.extend(["--truncations"] + truncations.split(","))
+    local_args.append("list")
+
+    result = run_cmd(local_args, cwd=REPO_DIR, capture=True)
+    lines = result.stdout.strip().split("\n")
+
+    # Count configs (lines starting with a number after the header)
+    config_count = sum(1 for line in lines if line and line[0:3].strip().isdigit())
+
+    click.echo(f"Will run {config_count - start_from} configurations (starting from {start_from})")
+    click.echo("This will run sequentially - each run must complete before the next starts.")
+    click.echo()
+
+    for config_id in range(start_from, config_count):
+        click.echo(f"\n{'='*60}")
+        click.echo(f"Starting configuration {config_id + 1}/{config_count}")
+        click.echo(f"{'='*60}")
+
+        # Run this config
+        ctx = click.Context(cmd_grid_run)
+        ctx.invoke(cmd_grid_run, config_id=config_id, rope_bases=rope_bases,
+                   truncations=truncations, replicates=replicates, single_gpu=single_gpu)
+
+        # Wait for completion
+        click.echo("\nWaiting for training to complete...")
+        import time
+        while True:
+            time.sleep(30)
+            result = ssh_cmd(f"test -f {REMOTE_PIDFILE} && ps -p $(cat {REMOTE_PIDFILE}) > /dev/null 2>&1 && echo running || echo stopped", capture=True)
+            if result.stdout.strip() != "running":
+                click.echo("Training completed.")
+                break
+            # Show progress
+            ssh_cmd(f"tail -1 {REMOTE_REPO}/train.log 2>/dev/null || true", check=False)
+
+    click.echo(f"\n{'='*60}")
+    click.echo("All grid search configurations completed!")
+    click.echo("Run 'python runpod_cli.py grid results' to see aggregated results.")
+
+
+@grid.command("results")
+@click.option("--csv", is_flag=True, help="Output as CSV")
+@click.option("--json", is_flag=True, help="Output as JSON")
+def cmd_grid_results(csv: bool, json_out: bool):
+    """Fetch and display grid search results from remote."""
+    if not ssh_available():
+        click.echo("Error: Cannot connect to RunPod. Run 'configure' first.", err=True)
+        sys.exit(1)
+
+    # Sync logs back from remote
+    click.echo("Fetching logs from remote...")
+    rsync_args = [
+        "rsync", "-avz", "--progress",
+        "-e", "ssh",
+        f"runpod:{REMOTE_REPO}/logs/",
+        f"{REPO_DIR}/logs/"
+    ]
+    run_cmd(rsync_args, check=False)
+
+    # Run local results aggregation
+    args = ["python", "grid_search.py", "results"]
+    if csv:
+        args.append("--csv")
+    if json_out:
+        args.append("--json")
+    run_cmd(args, cwd=REPO_DIR)
+
+
 if __name__ == "__main__":
     cli()
