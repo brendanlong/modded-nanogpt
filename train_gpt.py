@@ -1722,11 +1722,30 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    # single GPU mode: use 1/8th batch size with 8x gradient accumulation for testing on a single H100
+    single_gpu: bool = False
+    # batch sizes (scaled down by 1/8 in single_gpu mode to match per-GPU batch of 8-GPU run)
+    _train_bs_base: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
+    _train_bs_extension_base: int = 24 * 2048 * 8
+    _val_batch_size_base: int = 4 * 64 * 1024 * 8
     train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 4 * 64 * 1024 * 8
+
+    @property
+    def train_bs_schedule(self) -> tuple:
+        # In single GPU mode, use 1/2 batch (4x larger than per-GPU in 8-GPU run)
+        # with 2 grad accum steps to get same effective batch and better GPU utilization
+        divisor = 2 if self.single_gpu else 1
+        return tuple(bs // divisor for bs in self._train_bs_base)
+
+    @property
+    def train_bs_extension(self) -> int:
+        divisor = 2 if self.single_gpu else 1
+        return self._train_bs_extension_base // divisor
+
+    @property
+    def val_batch_size(self) -> int:
+        divisor = 2 if self.single_gpu else 1
+        return self._val_batch_size_base // divisor
     # optimization
     num_scheduled_iterations: int = 1560  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1747,6 +1766,9 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
+# Enable single GPU mode via environment variable: SINGLE_GPU=1
+args.single_gpu = os.environ.get("SINGLE_GPU", "0") == "1"
+
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
 args.val_files = os.path.join(data_path, args.val_files)
@@ -1755,7 +1777,9 @@ args.val_files = os.path.join(data_path, args.val_files)
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+# In single_gpu mode: 1/2 batch with 2 grad accum steps (same effective batch, better GPU utilization)
+# In multi-gpu mode: batch distributed across GPUs with (8 // world_size) accumulation
+grad_accum_steps = 2 if args.single_gpu else (8 // world_size)
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
