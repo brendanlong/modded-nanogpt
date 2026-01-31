@@ -912,13 +912,212 @@ class YarnPairedHead(nn.Module):
         self.factor2[..., 1::2] *= -1
         self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
 
+# -----------------------------------------------------------------------------
+# PoPE (Polar Positional Encoding) - replaces RoPE
+# From "Polar Positional Encoding" (arXiv:2509.10534v2)
+# Key idea: separate content (magnitude) from position (phase)
+# μ = softplus(x) for non-negative magnitudes
+# Phase is purely positional: t*θ for queries, s*θ + δ for keys
+# δ is a learnable phase-shift per frequency channel
+
+class Pope(nn.Module):
+    """Polar Positional Encoding - replaces RoPE/Yarn
+
+    Converts real Q/K to complex Cartesian form for PoPE attention.
+    Output dimension is 2x input dimension (real + imag parts interleaved).
+    """
+    def __init__(self, head_dim, max_seq_len):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        # Number of rotated dimensions (first half rotates, second half stationary)
+        self.n_rotated = head_dim // 2
+        # Learnable phase shifts δ, one per dimension that gets rotated
+        # Initialize to 0 for better length extrapolation (per paper)
+        self.delta = nn.Parameter(torch.zeros(self.n_rotated, device=device))
+        self.reset()
+
+    def reset(self):
+        # Angular frequencies θ_c - one per dimension (PoPE uses d frequencies vs RoPE's d/2)
+        # For rotated dims: use frequencies from low to high
+        angular_freq = (1 / 1024) ** torch.linspace(
+            0, 1, steps=self.n_rotated, dtype=torch.float32, device=device
+        )
+        # Stationary dimensions have 0 frequency (half-truncate optimization)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim - self.n_rotated)])
+
+        t = torch.arange(2 * self.max_seq_len, dtype=torch.float32, device=device)
+        theta = torch.outer(t, angular_freq)  # [2*max_seq_len, head_dim]
+
+        # Cache cos/sin for positions (queries use these directly)
+        self.cos_cache = nn.Buffer(theta.cos().to(torch.bfloat16), persistent=False)
+        self.sin_cache = nn.Buffer(theta.sin().to(torch.bfloat16), persistent=False)
+        self.angular_freq = angular_freq
+        self.attn_scale = 0.1
+
+    def pope(self, x_BTHD, apply_delta=False):
+        """Convert to PoPE Cartesian form with interleaved real/imag
+
+        Input: [B, T, H, D] where D = head_dim
+        Output: [B, T, H, 2*D] with interleaved [x0, y0, x1, y1, ...]
+
+        For each dimension c:
+          x_c = μ_c * cos(t*θ_c + δ_c)  (real part)
+          y_c = μ_c * sin(t*θ_c + δ_c)  (imag part)
+        where μ_c = softplus(input_c)
+        """
+        B, T, H, D = x_BTHD.shape
+
+        # Compute magnitudes: μ = softplus(x) - ensures non-negative
+        mu = F.softplus(x_BTHD)  # [B, T, H, D]
+
+        # Get phases for current positions
+        if apply_delta:
+            # For keys: add learnable phase shift δ (clamped to [-2π, 0])
+            delta_clamped = self.delta.clamp(-2 * math.pi, 0)
+            # Pad delta with zeros for stationary dims
+            delta_full = torch.cat([delta_clamped, delta_clamped.new_zeros(D - self.n_rotated)])
+            theta = torch.outer(
+                torch.arange(T, dtype=torch.float32, device=x_BTHD.device),
+                self.angular_freq
+            ) + delta_full  # [T, D]
+            cos_t = theta.cos().to(x_BTHD.dtype)
+            sin_t = theta.sin().to(x_BTHD.dtype)
+        else:
+            cos_t = self.cos_cache[:T]
+            sin_t = self.sin_cache[:T]
+
+        # Reshape for broadcasting: [1, T, 1, D]
+        cos_t = cos_t[None, :, None, :]
+        sin_t = sin_t[None, :, None, :]
+
+        # Compute Cartesian components: x = μ*cos(φ), y = μ*sin(φ)
+        x_part = mu * cos_t  # [B, T, H, D] - real parts
+        y_part = mu * sin_t  # [B, T, H, D] - imag parts
+
+        # Interleave real and imag: [x0, y0, x1, y1, ...]
+        result = torch.empty(B, T, H, 2 * D, device=x_BTHD.device, dtype=x_BTHD.dtype)
+        result[..., 0::2] = x_part  # Even indices = real
+        result[..., 1::2] = y_part  # Odd indices = imag
+
+        return result
+
+    def apply(self, old_window: int, new_window: int, alpha: int = 1, beta: int = 32):
+        # YaRN-style interpolation for length extrapolation
+        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
+        t = torch.arange(2 * self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        theta = torch.outer(t, self.angular_freq)
+        self.cos_cache.copy_(theta.cos())
+        self.sin_cache.copy_(theta.sin())
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
+
+
+class PopePairedHead(nn.Module):
+    """PoPE for paired-head attention where head dimension is doubled.
+
+    Similar to Pope but handles even/odd position interleaving for paired heads.
+    """
+    def __init__(self, head_dim, max_seq_len):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.n_rotated = head_dim // 2
+        self.delta = nn.Parameter(torch.zeros(self.n_rotated, device=device))
+        self.reset()
+
+    def reset(self):
+        angular_freq = (1 / 1024) ** torch.linspace(
+            0, 1, steps=self.n_rotated, dtype=torch.float32, device=device
+        )
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim - self.n_rotated)])
+
+        t = torch.arange(2 * self.max_seq_len, dtype=torch.float32, device=device)
+        t_even = 2 * t
+        t_odd = 2 * t + 1
+
+        theta1 = torch.outer(t_even, angular_freq)  # Even positions
+        theta2 = torch.outer(t_odd, angular_freq)   # Odd positions
+
+        # For paired heads, we need cos/sin for both even and odd positions concatenated
+        self.cos_cache = nn.Buffer(
+            torch.cat((theta1.cos(), theta2.cos()), dim=-1).to(torch.bfloat16),
+            persistent=False
+        )
+        self.sin_cache = nn.Buffer(
+            torch.cat((theta1.sin(), theta2.sin()), dim=-1).to(torch.bfloat16),
+            persistent=False
+        )
+        self.angular_freq = angular_freq
+        self.attn_scale = 0.1
+
+    def pope(self, x_BTHD, apply_delta=False):
+        """Convert to PoPE Cartesian form for paired heads.
+
+        Input: [B, T, H, 2*D] (paired head dimension)
+        Output: [B, T, H, 4*D] with interleaved real/imag
+        """
+        B, T, H, D2 = x_BTHD.shape  # D2 = 2 * head_dim for paired heads
+        D = D2 // 2  # Original head_dim
+
+        # Compute magnitudes
+        mu = F.softplus(x_BTHD)  # [B, T, H, 2*D]
+
+        if apply_delta:
+            delta_clamped = self.delta.clamp(-2 * math.pi, 0)
+            delta_full = torch.cat([delta_clamped, delta_clamped.new_zeros(D - self.n_rotated)])
+            # Double delta for paired dims
+            delta_paired = torch.cat([delta_full, delta_full])
+
+            t = torch.arange(T, dtype=torch.float32, device=x_BTHD.device)
+            t_even = 2 * t
+            t_odd = 2 * t + 1
+
+            theta1 = torch.outer(t_even, self.angular_freq) + delta_full
+            theta2 = torch.outer(t_odd, self.angular_freq) + delta_full
+
+            cos_t = torch.cat((theta1.cos(), theta2.cos()), dim=-1).to(x_BTHD.dtype)
+            sin_t = torch.cat((theta1.sin(), theta2.sin()), dim=-1).to(x_BTHD.dtype)
+        else:
+            cos_t = self.cos_cache[:T]
+            sin_t = self.sin_cache[:T]
+
+        cos_t = cos_t[None, :, None, :]
+        sin_t = sin_t[None, :, None, :]
+
+        x_part = mu * cos_t
+        y_part = mu * sin_t
+
+        result = torch.empty(B, T, H, 2 * D2, device=x_BTHD.device, dtype=x_BTHD.dtype)
+        result[..., 0::2] = x_part
+        result[..., 1::2] = y_part
+
+        return result
+
+    def apply(self, old_window: int, new_window: int, alpha: int = 1, beta: int = 32):
+        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
+        t = torch.arange(2 * self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        t_even = 2 * t
+        t_odd = 2 * t + 1
+        theta1 = torch.outer(t_even, self.angular_freq)
+        theta2 = torch.outer(t_odd, self.angular_freq)
+        self.cos_cache.copy_(torch.cat((theta1.cos(), theta2.cos()), dim=-1))
+        self.sin_cache.copy_(torch.cat((theta1.sin(), theta2.sin()), dim=-1))
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
+
+
 @dataclass
 class AttnArgs:
     ve: torch.Tensor
     sa_lambdas: torch.Tensor
     seqlens: torch.Tensor
     bm_size: int
-    yarn: Yarn
+    pope: Pope  # Changed from yarn: Yarn
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
@@ -940,7 +1139,7 @@ class CausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        yarn = attn_args.yarn
+        pope = attn_args.pope
         ve, sa_lambdas, key_offset = attn_args.ve, attn_args.sa_lambdas, attn_args.key_offset
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         # sparse gated attention to enable context based no-op by @classiclarryd
@@ -949,20 +1148,36 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = yarn.rotary(q), yarn.rotary(k)
+
+        # PoPE: convert to Cartesian form (2x dimension)
+        # q: no delta, k: with learnable delta
+        q = pope.pope(q, apply_delta=False)  # [B, T, H, 2*D]
+        k = pope.pope(k, apply_delta=True)   # [B, T, H, 2*D]
+
         if key_offset:
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
-            k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:]
+            # In PoPE with 2x dim, stationary dims are in the second half, interleaved
+            # Original: k[:, 1:, :, self.head_dim // 2:] maps to k[:, 1:, :, self.head_dim:]
+            k[:, 1:, :, self.head_dim:] = k[:, :-1, :, self.head_dim:]
+
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T, self.num_heads, 1)
             v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
+        # Expand V to match Q/K dimension (2x) by interleaving with zeros
+        # v: [B, T, H, D] -> v_expanded: [B, T, H, 2*D]
+        v_expanded = torch.zeros(B, T, self.num_heads, 2 * self.head_dim, device=v.device, dtype=v.dtype)
+        v_expanded[..., 0::2] = v  # Real parts = original V
+        # Imaginary parts stay zero
+
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v_expanded[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+                                                        causal=True, softmax_scale=pope.attn_scale, window_size=(bm_size, 0))
+        # y: [T, H, 2*D] -> extract real part (even indices)
+        y = y[..., 0::2]  # [T, H, D]
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -989,7 +1204,7 @@ class PairedHeadCausalSelfAttention(nn.Module):
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
-        yarn = attn_args.yarn
+        pope = attn_args.pope
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, bm_size = attn_args.seqlens, attn_args.bm_size
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
@@ -997,19 +1212,28 @@ class PairedHeadCausalSelfAttention(nn.Module):
         q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k)
 
-        # delay q,k reshape until rotary makes data contiguous, to enable view (non-copy)
+        # Reshape for paired heads (combine pairs of heads)
         q = q.view(B, T, self.num_heads // 2, self.head_dim * 2)
         k = k.view(B, T, self.num_heads // 2, self.head_dim * 2)
         v = v.reshape(B, T*2, self.num_heads//2, self.head_dim)
 
-        q, k = yarn.rotary(q), yarn.rotary(k)
+        # PoPE: convert to Cartesian form (2x dimension)
+        # For paired heads, input is [B, T, H/2, 2*D], output is [B, T, H/2, 4*D]
+        q = pope.pope(q, apply_delta=False)  # [B, T, H/2, 4*D]
+        k = pope.pope(k, apply_delta=True)   # [B, T, H/2, 4*D]
 
-        q = q.view(B, T*2, self.num_heads//2, self.head_dim)
-        k = k.view(B, T*2, self.num_heads//2, self.head_dim)
+        # Reshape to interleaved sequence format for paired head attention
+        # q, k: [B, T, H/2, 4*D] -> [B, T*2, H/2, 2*D]
+        q = q.view(B, T*2, self.num_heads//2, self.head_dim * 2)
+        k = k.view(B, T*2, self.num_heads//2, self.head_dim * 2)
 
         if ve is not None:
             ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T*2, self.num_heads//2, 1)
             v = v + ve_gate_out * ve.view_as(v)
+
+        # Expand V to match Q/K dimension (2x)
+        v_expanded = torch.zeros(B, T*2, self.num_heads//2, 2 * self.head_dim, device=v.device, dtype=v.dtype)
+        v_expanded[..., 0::2] = v  # Real parts = original V
 
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
@@ -1017,9 +1241,11 @@ class PairedHeadCausalSelfAttention(nn.Module):
         seqlens = 2 * seqlens
         max_len = 2 * max_len
 
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v_expanded[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+                                                        causal=True, softmax_scale=pope.attn_scale, window_size=(bm_size, 0))
+        # y: [T*2, H/2, 2*D] -> extract real part
+        y = y[..., 0::2]  # [T*2, H/2, D]
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
@@ -1156,8 +1382,8 @@ class GPT(nn.Module):
                   use_paired_head=(i in self.paired_head_layers))
             for i in range(num_layers)
         ])
-        self.yarn = Yarn(head_dim, max_seq_len)
-        self.yarn_paired_head = YarnPairedHead(head_dim, max_seq_len)
+        self.pope = Pope(head_dim, max_seq_len)
+        self.pope_paired_head = PopePairedHead(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
@@ -1255,13 +1481,13 @@ class GPT(nn.Module):
         mlp_projs = self.mlp_bank[:, 1, :, :].unbind(0)  # tuple of [mlp_hdim, dim] tensors
 
         for i in range(self.num_layers):
-            yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
+            pope = self.pope_paired_head if i in self.paired_head_layers else self.pope
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
                 seqlens=seqlens,
                 bm_size=bm_sizes[i],
-                yarn=yarn,
+                pope=pope,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
                 ve_gate_w=ve_gates[i]
@@ -1667,8 +1893,8 @@ class TrainingManager():
     def advance_schedule(self, step: int):
         self.ws_short, new_ws_long = get_ws(step)
         if new_ws_long != self.ws_long:
-            self.model.yarn.apply(self.ws_long, new_ws_long)
-            self.model.yarn_paired_head.apply(self.ws_long, new_ws_long)
+            self.model.pope.apply(self.ws_long, new_ws_long)
+            self.model.pope_paired_head.apply(self.ws_long, new_ws_long)
 
         new_batch_size = get_bs(step)
         if new_batch_size != self.batch_size:
@@ -1707,8 +1933,8 @@ class TrainingManager():
 
         self.ws_short, self.ws_long = get_ws(0)
         self.batch_size = get_bs(0)
-        self.model.yarn.reset()
-        self.model.yarn_paired_head.reset()
+        self.model.pope.reset()
+        self.model.pope_paired_head.reset()
 
     def get_state(self):
         return copy.deepcopy(self.optimizer.state_dict())
