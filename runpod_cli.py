@@ -212,7 +212,7 @@ def cmd_sync_code(dry_run: bool):
     ssh_cmd(f"mkdir -p {REMOTE_REPO}")
 
     rsync_args = [
-        "rsync", "-avz", "--progress",
+        "rsync", "-rlptvz", "--progress",  # -a without -o/-g to avoid chown errors
         "--exclude", ".git",
         "--exclude", "__pycache__",
         "--exclude", "*.pyc",
@@ -266,9 +266,9 @@ def cmd_setup():
 
     click.echo("Setting up remote environment...")
 
-    # Install tmux
-    click.echo("\n[1/4] Installing tmux...")
-    ssh_cmd("apt-get update -qq && apt-get install -y -qq tmux")
+    # Install tmux and rsync
+    click.echo("\n[1/4] Installing tmux and rsync...")
+    ssh_cmd("apt-get update -qq && apt-get install -y -qq tmux rsync")
 
     # Sync code
     click.echo("\n[2/4] Syncing code...")
@@ -311,12 +311,12 @@ def cmd_train_start(single_gpu: bool):
         sys.exit(1)
 
     # Build command
-    env = "SINGLE_GPU=1 " if single_gpu else ""
-    train_cmd = f"{env}torchrun --nproc_per_node=1 train_gpt.py"
+    env_export = "export SINGLE_GPU=1 && " if single_gpu else ""
+    train_cmd = "torchrun --nproc_per_node=1 train_gpt.py"
 
     # Start training with nohup, save pid
     remote_cmd = f"""
-        (cd {REMOTE_REPO} && nohup {train_cmd} > {REMOTE_LOGFILE} 2>&1 & echo $! > {REMOTE_PIDFILE})
+        cd {REMOTE_REPO} && {env_export}nohup {train_cmd} > {REMOTE_LOGFILE} 2>&1 & echo $! > {REMOTE_PIDFILE}
     """
 
     click.echo("Starting training...")
